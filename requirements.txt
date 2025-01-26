@@ -3,4 +3,5 @@ openai
 pandas
 plotly
 numpy
-edge-tts 
+edge-tts
+python-docx 

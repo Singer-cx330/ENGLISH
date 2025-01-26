@@ -13,6 +13,9 @@ import edge_tts
 import asyncio
 import hashlib
 from pathlib import Path
+from docx import Document
+from docx.shared import Inches, Pt
+from io import BytesIO
 
 # 设置页面配置
 st.set_page_config(
@@ -243,43 +246,179 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
-def get_ai_response(prompt, system_prompt=""):
+# 添加 API 调用重试机制
+def get_ai_response(prompt, system_prompt="", max_retries=3):
     if not st.session_state.api_key:
-        st.error("请先输入API密钥！")
+        st.error("请先设置 API 密钥")
         return None
-        
-    try:
-        client = OpenAI(
-            api_key=st.session_state.api_key,
-            base_url="https://api.deepseek.com"
-        )
-        
-        # 创建一个空的占位符用于流式输出
-        output_placeholder = st.empty()
-        full_response = ""
-        
-        # 发送请求并获取流式响应
-        response = client.chat.completions.create(
-            model="deepseek-chat",
-            messages=[
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": prompt}
-            ],
-            stream=True
-        )
-        
-        # 逐步显示响应内容
-        for chunk in response:
-            if chunk.choices[0].delta.content is not None:
-                full_response += chunk.choices[0].delta.content
-                output_placeholder.markdown(full_response + "▌")
-        
-        # 显示最终完整响应
-        output_placeholder.markdown(full_response)
-        return full_response
-    except Exception as e:
-        st.error(f"Error: {str(e)}")
+    
+    client = OpenAI(
+        api_key=st.session_state.api_key,
+        base_url="https://api.deepseek.com/v1"  # 使用 Deepseek API
+    )
+    retry_count = 0
+    
+    while retry_count < max_retries:
+        try:
+            response = client.chat.completions.create(
+                model="deepseek-chat",
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": prompt}
+                ],
+                temperature=0.7,
+                max_tokens=2000,
+                top_p=0.95,
+                frequency_penalty=0,
+                presence_penalty=0
+            )
+            return response.choices[0].message.content
+        except Exception as e:
+            retry_count += 1
+            if retry_count == max_retries:
+                st.error(f"API 调用失败: {str(e)}")
+                return None
+            time.sleep(1)  # 等待1秒后重试
+
+# 添加缓存装饰器
+@st.cache_data(ttl=3600)  # 缓存1小时
+def get_cached_response(prompt, system_prompt=""):
+    return get_ai_response(prompt, system_prompt)
+
+# 添加学习数据缓存
+@st.cache_data(ttl=86400)  # 缓存24小时
+def calculate_study_statistics():
+    if 'study_time' not in st.session_state:
         return None
+    
+    total_time = 0
+    category_times = {}
+    
+    for date, categories in st.session_state.study_time.items():
+        for category, minutes in categories.items():
+            total_time += minutes
+            category_times[category] = category_times.get(category, 0) + minutes
+    
+    return {
+        'total_time': total_time,
+        'category_times': category_times,
+        'avg_daily': total_time / len(st.session_state.study_time) if st.session_state.study_time else 0
+    }
+
+class DataManager:
+    def __init__(self):
+        self.data_dir = Path("user_data")
+        self.data_dir.mkdir(exist_ok=True)
+        self.backup_dir = self.data_dir / "backups"
+        self.backup_dir.mkdir(exist_ok=True)
+    
+    def save_user_data(self, username, data):
+        """保存用户数据"""
+        file_path = self.data_dir / f"{username}.json"
+        # 创建临时文件
+        temp_path = file_path.with_suffix('.tmp')
+        try:
+            with open(temp_path, 'w', encoding='utf-8') as f:
+                json.dump(data, f, ensure_ascii=False, indent=2)
+            # 安全地替换文件
+            temp_path.replace(file_path)
+            # 创建备份
+            self._create_backup(username, data)
+            return True
+        except Exception as e:
+            st.error(f"保存数据失败: {str(e)}")
+            return False
+    
+    def load_user_data(self, username):
+        """加载用户数据"""
+        file_path = self.data_dir / f"{username}.json"
+        try:
+            with open(file_path, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+                # 验证数据完整性
+                if not validate_user_data(data):
+                    data = repair_user_data(data)
+                return data
+        except FileNotFoundError:
+            return None
+        except Exception as e:
+            st.error(f"读取数据失败: {str(e)}")
+            return None
+    
+    def _create_backup(self, username, data):
+        """创建数据备份"""
+        backup_path = self.backup_dir / f"{username}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
+        try:
+            with open(backup_path, 'w', encoding='utf-8') as f:
+                json.dump(data, f, ensure_ascii=False, indent=2)
+        except Exception as e:
+            st.warning(f"创建备份失败: {str(e)}")
+    
+    def restore_from_backup(self, username, backup_file):
+        """从备份恢复数据"""
+        try:
+            with open(backup_file, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+            return self.save_user_data(username, data)
+        except Exception as e:
+            st.error(f"恢复备份失败: {str(e)}")
+            return False
+
+def validate_user_data(data):
+    """验证用户数据的完整性"""
+    required_fields = {
+        'history': list,
+        'progress': dict,
+        'study_time': dict,
+        'vocabulary': list,
+        'notes': dict,
+        'achievements': dict,
+        'learning_path': dict
+    }
+    
+    for field, field_type in required_fields.items():
+        if field not in data or not isinstance(data[field], field_type):
+            return False
+    return True
+
+def repair_user_data(data):
+    """修复损坏的用户数据"""
+    template = {
+        'history': [],
+        'progress': {
+            '写作': 0,
+            '口语': 0,
+            '词汇': 0,
+            '语法': 0
+        },
+        'study_time': {},
+        'vocabulary': [],
+        'notes': {
+            '写作': [],
+            '口语': [],
+            '词汇': [],
+            '语法': []
+        },
+        'achievements': {
+            '初学者': False,
+            '勤奋学习者': False,
+            '词汇大师': False,
+            '写作能手': False
+        },
+        'learning_path': {
+            'current_level': 'beginner',
+            'target_level': 'advanced',
+            'milestones': [],
+            'completed_steps': []
+        }
+    }
+    
+    # 修复缺失或损坏的字段
+    for key, value in template.items():
+        if key not in data or not isinstance(data[key], type(value)):
+            data[key] = value
+    
+    return data
 
 # 添加历史记录功能
 def save_to_history(category, content, result):
@@ -582,21 +721,45 @@ class NoteSystem:
         }
         st.session_state.notes[category].append(note)
     
-    def display_notes(self, category=None):
-        if category:
-            notes = st.session_state.notes[category]
-        else:
-            notes = [note for notes in st.session_state.notes.values() for note in notes]
+    def export_to_word(self, category=None):
+        """导出笔记到Word文档"""
+        doc = Document()
         
-        for note in sorted(notes, key=lambda x: x['timestamp'], reverse=True):
-            with st.expander(f"{note['title']} - {note['timestamp']}"):
-                st.markdown(note['content'])
-                # 添加编辑和删除按钮
-                col1, col2 = st.columns([1, 4])
-                with col1:
-                    if st.button("删除", key=f"del_{note['timestamp']}"):
-                        notes.remove(note)
-                        st.success("笔记已删除")
+        # 设置文档标题
+        title = doc.add_heading('学习笔记', 0)
+        title.alignment = 1  # 居中对齐
+        
+        # 添加基本信息
+        doc.add_paragraph(f'导出时间：{datetime.now().strftime("%Y-%m-%d %H:%M:%S")}')
+        doc.add_paragraph(f'笔记类别：{"全部" if category is None else category}')
+        
+        # 获取要导出的笔记
+        if category:
+            notes_to_export = st.session_state.notes[category]
+        else:
+            notes_to_export = []
+            for cat_notes in st.session_state.notes.values():
+                notes_to_export.extend(cat_notes)
+        
+        # 按时间排序
+        notes_to_export.sort(key=lambda x: x['timestamp'], reverse=True)
+        
+        # 添加笔记内容
+        for note in notes_to_export:
+            # 添加笔记标题
+            doc.add_heading(note['title'], level=1)
+            # 添加时间戳
+            doc.add_paragraph(f"创建时间：{note['timestamp']}", style='Subtitle')
+            # 添加笔记内容
+            doc.add_paragraph(note['content'])
+            # 添加分隔线
+            doc.add_paragraph('_' * 50)
+        
+        # 保存到内存
+        doc_io = BytesIO()
+        doc.save(doc_io)
+        doc_io.seek(0)
+        return doc_io
 
 # 添加智能学习路径规划
 def generate_learning_path():
@@ -728,8 +891,81 @@ class UserManager:
         with open(user_file, "w", encoding="utf-8") as f:
             json.dump(user_data, f, ensure_ascii=False, indent=2)
 
+class PerformanceMonitor:
+    def __init__(self):
+        self.metrics = {
+            'api_calls': 0,
+            'api_errors': 0,
+            'response_times': [],
+            'cache_hits': 0,
+            'cache_misses': 0
+        }
+    
+    def record_api_call(self, success, response_time):
+        """记录API调用指标"""
+        self.metrics['api_calls'] += 1
+        if not success:
+            self.metrics['api_errors'] += 1
+        self.metrics['response_times'].append(response_time)
+    
+    def record_cache_access(self, hit):
+        """记录缓存访问"""
+        if hit:
+            self.metrics['cache_hits'] += 1
+        else:
+            self.metrics['cache_misses'] += 1
+    
+    def get_statistics(self):
+        """获取性能统计"""
+        if not self.metrics['response_times']:
+            return None
+        
+        return {
+            'total_calls': self.metrics['api_calls'],
+            'error_rate': self.metrics['api_errors'] / self.metrics['api_calls'] if self.metrics['api_calls'] > 0 else 0,
+            'avg_response_time': sum(self.metrics['response_times']) / len(self.metrics['response_times']),
+            'cache_hit_rate': self.metrics['cache_hits'] / (self.metrics['cache_hits'] + self.metrics['cache_misses']) if (self.metrics['cache_hits'] + self.metrics['cache_misses']) > 0 else 0
+        }
+
+def initialize_session_state():
+    """初始化所有必要的 session_state 变量"""
+    if 'achievements' not in st.session_state:
+        st.session_state.achievements = {
+            '初学者': False,
+            '勤奋学习者': False,
+            '词汇大师': False,
+            '写作能手': False
+        }
+    
+    if 'focus_timer' not in st.session_state:
+        st.session_state.focus_timer = {
+            'active': False,
+            'start_time': None,
+            'duration': 25  # 默认25分钟
+        }
+    
+    if 'leaderboard' not in st.session_state:
+        st.session_state.leaderboard = []
+    
+    if 'notes' not in st.session_state:
+        st.session_state.notes = {
+            '写作': [],
+            '口语': [],
+            '词汇': [],
+            '语法': []
+        }
+
 def main():
+    # 在主函数开始时初始化
+    initialize_session_state()
+    
     st.title("🎓 英语学习助手")
+    
+    # 初始化组件
+    if 'data_manager' not in st.session_state:
+        st.session_state.data_manager = DataManager()
+    if 'performance_monitor' not in st.session_state:
+        st.session_state.performance_monitor = PerformanceMonitor()
     
     # 初始化用户管理器
     if 'user_manager' not in st.session_state:
@@ -853,7 +1089,7 @@ def main():
                         with st.spinner('正在分析您的写作...'):
                             system_prompt = f"你是一位专业的英语写作教师，专注于{writing_type}。请针对学生的写作内容提供详细的修改建议和改进方案。"
                             st.markdown('<div class="result-container">', unsafe_allow_html=True)
-                            response = get_ai_response(user_input, system_prompt)
+                            response = get_cached_response(user_input, system_prompt)
                             if response:
                                 save_to_history('写作', user_input, response)
                                 update_progress('写作')
@@ -870,7 +1106,7 @@ def main():
                         4. 形容词/动词使用频率
                         5. 改进建议
                         """
-                        response = get_ai_response(user_input, system_prompt)
+                        response = get_cached_response(user_input, system_prompt)
                         st.markdown(response)
                 
                 # 添加写作模板库
@@ -894,7 +1130,7 @@ def main():
                         4. 写作技巧
                         5. 示例片段
                         """
-                        response = get_ai_response("", system_prompt)
+                        response = get_cached_response("", system_prompt)
                         st.markdown(response)
 
                 # 添加写作目标设置
@@ -912,7 +1148,7 @@ def main():
                     )
                     if st.button("生成提示"):
                         system_prompt = f"请为{prompt_type}生成3个具体的写作提示或建议。"
-                        response = get_ai_response("", system_prompt)
+                        response = get_cached_response("", system_prompt)
                         st.markdown(response)
 
             elif option == "口语练习指导":
@@ -940,7 +1176,7 @@ def main():
                         with st.spinner('正在生成口语练习内容...'):
                             system_prompt = f"你是一位英语口语教师。请为{level}水平的学生提供关于'{topic}'的口语练习建议和{situation}场景下的示例对话。"
                             st.markdown('<div class="result-container">', unsafe_allow_html=True)
-                            response = get_ai_response(topic, system_prompt)
+                            response = get_cached_response(topic, system_prompt)
                             st.markdown('</div>', unsafe_allow_html=True)
                 
                 # 添加发音技巧指导
@@ -952,7 +1188,7 @@ def main():
                     )
                     if st.button("获取发音指导"):
                         system_prompt = f"请提供关于{', '.join(pronunciation_focus)}的详细发音技巧和练习方法。"
-                        response = get_ai_response("", system_prompt)
+                        response = get_cached_response("", system_prompt)
                         st.markdown(response)
 
                 # 添加发音评估功能
@@ -981,7 +1217,7 @@ def main():
                         3. 文化差异提示
                         4. 常见错误提醒
                         """
-                        response = get_ai_response("", system_prompt)
+                        response = get_cached_response("", system_prompt)
                         st.markdown(response)
                 
                 # 添加发音评分系统
@@ -1027,7 +1263,7 @@ def main():
                         with st.spinner('正在查询词汇信息...'):
                             system_prompt = f"请提供单词 '{word}' 的详细信息，重点关注：{', '.join(study_focus)}。"
                             st.markdown('<div class="word-card">', unsafe_allow_html=True)
-                            response = get_ai_response(word, system_prompt)
+                            response = get_cached_response(word, system_prompt)
                             st.markdown('</div>', unsafe_allow_html=True)
                 
                 # 添加生词本功能
@@ -1044,7 +1280,7 @@ def main():
                             with col2:
                                 if st.button("复习", key=f"review_{word_item['word']}"):
                                     system_prompt = f"请生成一个包含单词 '{word_item['word']}' 的例句，并解释用法。"
-                                    response = get_ai_response("", system_prompt)
+                                    response = get_cached_response("", system_prompt)
                                     st.markdown(response)
                     else:
                         st.info("生词本还是空的，开始添加新单词吧！")
@@ -1106,7 +1342,7 @@ def main():
                         3. 2个情境应用题
                         每个题目都提供详细解析。
                         """
-                        response = get_ai_response("", system_prompt)
+                        response = get_cached_response("", system_prompt)
                         st.markdown(response)
                 
                 # 添加智能复习提醒
@@ -1152,7 +1388,7 @@ def main():
                         with st.spinner('正在分析文本...'):
                             system_prompt = f"请以{formality}的语气检查文本，重点关注：{', '.join(check_focus)}。"
                             st.markdown('<div class="result-container">', unsafe_allow_html=True)
-                            response = get_ai_response(text, system_prompt)
+                            response = get_cached_response(text, system_prompt)
                             st.markdown('</div>', unsafe_allow_html=True)
             
             elif option == "文献翻译":
@@ -1181,7 +1417,7 @@ def main():
                         with st.spinner('正在翻译...'):
                             system_prompt = f"请将以下{field}领域的文本{'从英文翻译成中文' if direction == '英译中' else '从中文翻译成英文'}，需要特别保留：{', '.join(preserve)}。"
                             st.markdown('<div class="result-container">', unsafe_allow_html=True)
-                            response = get_ai_response(text, system_prompt)
+                            response = get_cached_response(text, system_prompt)
                             st.markdown('</div>', unsafe_allow_html=True)
 
         with tabs[1]:
@@ -1217,7 +1453,7 @@ def main():
                     st.markdown(f"建议加强 **{lowest_category}** 方面的练习。")
                     
                     system_prompt = f"请针对用户在{lowest_category}方面的学习给出具体的提升建议和练习方法。"
-                    suggestion = get_ai_response("", system_prompt)
+                    suggestion = get_cached_response("", system_prompt)
                     st.markdown(suggestion)
 
         with tabs[3]:
@@ -1298,7 +1534,7 @@ def main():
                     - 平均每日学习时长：{avg_time:.1f}分钟
                     请提供具体的改进建议和学习计划。
                     """
-                    suggestions = get_ai_response("", system_prompt)
+                    suggestions = get_cached_response("", system_prompt)
                     st.write("### AI建议：")
                     st.write(suggestions)
             
@@ -1451,21 +1687,71 @@ def main():
                         unsafe_allow_html=True
                     )
 
-    # 添加笔记系统
-    note_system = NoteSystem()
+    # 修改笔记系统部分
     with st.sidebar:
-        with st.expander("📝 学习笔记"):
+        st.markdown("### 📝 学习笔记")
+        
+        # 添加新笔记
+        with st.expander("添加新笔记"):
             note_category = st.selectbox("选择分类", list(st.session_state.notes.keys()))
             note_title = st.text_input("笔记标题")
             note_content = st.text_area("笔记内容")
             if st.button("保存笔记"):
                 if note_title and note_content:
+                    note_system = NoteSystem()
                     note_system.add_note(note_category, note_title, note_content)
                     st.success("笔记已保存！")
+                    st.rerun()
+        
+        # 笔记导出
+        with st.expander("导出笔记"):
+            export_category = st.selectbox(
+                "选择要导出的分类",
+                ["全部"] + list(st.session_state.notes.keys()),
+                key="export_category"
+            )
             
-            # 显示笔记
-            st.markdown("### 我的笔记")
-            note_system.display_notes(note_category)
+            if st.button("导出到Word"):
+                note_system = NoteSystem()
+                category = None if export_category == "全部" else export_category
+                doc_io = note_system.export_to_word(category)
+                
+                # 提供下载
+                st.download_button(
+                    label="📥 下载Word文档",
+                    data=doc_io.getvalue(),
+                    file_name=f'学习笔记_{datetime.now().strftime("%Y%m%d")}.docx',
+                    mime='application/vnd.openxmlformats-officedocument.wordprocessingml.document'
+                )
+        
+        # 显示笔记预览
+        st.markdown("### 笔记预览")
+        preview_category = st.selectbox(
+            "选择分类查看",
+            list(st.session_state.notes.keys()),
+            key="preview_category"
+        )
+        
+        notes = st.session_state.notes[preview_category]
+        if notes:
+            for note in sorted(notes, key=lambda x: x['timestamp'], reverse=True):
+                with st.container():
+                    st.markdown(f"""
+                        <div style="
+                            border-left: 4px solid #00a67d;
+                            padding: 1rem;
+                            margin: 1rem 0;
+                            background: #2d2d2d;
+                            border-radius: 5px;
+                        ">
+                            <h4>{note['title']}</h4>
+                            <p><small>{note['timestamp']}</small></p>
+                            <hr>
+                            {note['content']}
+                        </div>
+                    """, unsafe_allow_html=True)
+        else:
+            st.info("该分类下还没有笔记")
 
 def get_review_interval(review_count):
     """基于艾宾浩斯遗忘曲线设置复习间隔"""
