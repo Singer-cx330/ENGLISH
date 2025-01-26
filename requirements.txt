@@ -1,0 +1,8 @@
+streamlit>=1.22.0
+openai
+pandas
+plotly
+numpy
+sounddevice
+scipy
+edge-tts 
