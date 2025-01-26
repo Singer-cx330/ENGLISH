@@ -3,8 +3,6 @@ from openai import OpenAI
 import json
 import time
 import numpy as np
-import sounddevice as sd
-from scipy.io import wavfile
 import tempfile
 import os
 import pandas as pd
@@ -246,41 +244,6 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
-# 修改音频录制类
-class AudioRecorder:
-    def __init__(self):
-        self.sample_rate = 44100
-        self.channels = 1
-        self.duration = 5  # 默认录音时长（秒）
-    
-    def record_audio(self):
-        """录制音频"""
-        try:
-            st.write("🎙️ 开始录音...")
-            # 录制音频
-            recording = sd.rec(
-                int(self.duration * self.sample_rate),
-                samplerate=self.sample_rate,
-                channels=self.channels
-            )
-            # 等待录音完成
-            sd.wait()
-            return recording, self.sample_rate
-        except Exception as e:
-            st.error(f"录音出错: {str(e)}")
-            return None, None
-
-    def save_audio(self, audio_data, sample_rate):
-        """保存音频到临时文件"""
-        try:
-            # 创建临时文件
-            with tempfile.NamedTemporaryFile(delete=False, suffix='.wav') as temp_audio:
-                wavfile.write(temp_audio.name, sample_rate, audio_data)
-                return temp_audio.name
-        except Exception as e:
-            st.error(f"保存音频出错: {str(e)}")
-            return None
-
 def get_ai_response(prompt, system_prompt=""):
     if not st.session_state.api_key:
         st.error("请先输入API密钥！")
@@ -514,15 +477,11 @@ def add_speech_recognition():
     st.markdown("""
     <div class="pronunciation-guide">
         <h3>🎤 语音练习</h3>
-        <p>1. 准备好要朗读的文本</p>
-        <p>2. 点击录音按钮，朗读文本</p>
-        <p>3. 等待AI分析您的发音</p>
+        <p>1. 输入要练习的文本</p>
+        <p>2. 听标准发音</p>
+        <p>3. 跟读练习</p>
     </div>
     """, unsafe_allow_html=True)
-    
-    # 创建音频记录器实例
-    if 'audio_recorder' not in st.session_state:
-        st.session_state.audio_recorder = AudioRecorder()
     
     # 示例文本
     sample_text = st.text_area(
@@ -531,47 +490,30 @@ def add_speech_recognition():
         height=100
     )
     
-    # 设置录音时长
-    duration = st.slider("录音时长（秒）", 3, 30, 5)
-    st.session_state.audio_recorder.duration = duration
+    if st.button("播放标准发音 🔊"):
+        audio_file = asyncio.run(text_to_speech(sample_text))
+        if audio_file:
+            st.audio(audio_file)
+            try:
+                os.unlink(audio_file)
+            except:
+                pass
     
-    if st.button("开始录音 🎤"):
-        # 录制音频
-        audio_data, sample_rate = st.session_state.audio_recorder.record_audio()
+    # AI 发音建议
+    if st.button("获取发音技巧"):
+        system_prompt = f"""
+        请为以下文本提供详细的发音指导：
+        {sample_text}
         
-        if audio_data is not None:
-            # 保存音频文件
-            audio_file = st.session_state.audio_recorder.save_audio(audio_data, sample_rate)
-            
-            if audio_file:
-                # 显示录音播放器
-                st.audio(audio_file)
-                
-                with st.spinner("正在分析您的发音..."):
-                    # 使用AI评估发音
-                    system_prompt = f"""
-                    您是一位专业的英语发音教师。请评估用户的发音：
-                    
-                    标准文本：{sample_text}
-                    
-                    请提供：
-                    1. 整体发音评分（满分100分）
-                    2. 发音优点分析
-                    3. 需要改进的地方
-                    4. 具体的发音技巧建议
-                    """
-                    
-                    evaluation = get_ai_response("", system_prompt)
-                    st.markdown("### 🎯 发音评估")
-                    st.markdown(evaluation)
-                
-                # 清理临时文件
-                try:
-                    os.unlink(audio_file)
-                except:
-                    pass
-        else:
-            st.error("录音失败，请检查麦克风设置后重试")
+        包含：
+        1. 重点音素分析
+        2. 重音和语调建议
+        3. 常见发音错误提醒
+        4. 练习方法建议
+        """
+        evaluation = get_ai_response("", system_prompt)
+        st.markdown("### 🎯 发音指导")
+        st.markdown(evaluation)
 
 # 修改文本转语音函数
 async def text_to_speech(text, lang='en'):
